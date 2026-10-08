@@ -4,6 +4,7 @@ require("dotenv").config();
 const express = require("express");
 const { google } = require("googleapis");
 const cookieSession = require("cookie-session");
+const OpenAI = require("openai");
 
 const app = express();
 app.use(express.json());
@@ -37,6 +38,11 @@ app.get("/auth", (req, res) => {
     res.redirect(url);
 });
 
+// Lets the frontend know whether this session has signed in to Google.
+app.get("/auth/status", (req, res) => {
+    res.json({ connected: Boolean(req.session.tokens) });
+});
+
 app.get("/oauth2callback", async (req, res) => {
     const code = req.query.code;
     if (!code) return res.send("No code provided ❌");
@@ -49,7 +55,9 @@ app.get("/oauth2callback", async (req, res) => {
       // Store tokens in session (so we can use later)
       req.session.tokens = tokens;
   
-      res.send("✅ Google OAuth successful! You can now use Calendar API. Go to /list-calendars to test.");
+      // Closes itself when opened as a popup by the frontend; the frontend then re-checks /auth/status.
+      res.send(`<p>✅ Google Calendar connected! You can close this window and return to the app.</p>
+        <script>if (window.opener) setTimeout(() => window.close(), 1000);</script>`);
     } catch (err) {
       console.error("Error retrieving tokens:", err);
       res.send("❌ Error retrieving access token.");
@@ -169,32 +177,53 @@ app.post("/add-event", async (req, res) => {
   }
 });
 
-// Endpoint to call OpenAI
-app.post("/api/generate-schedule", async (req, res) => {
-  try {
-    const { prompt } = req.body;
+// AI client: the OpenAI SDK works with any OpenAI-compatible API (Google Gemini, OpenAI, Groq…).
+// Configured in .env with AI_BASE_URL, AI_API_KEY and AI_MODEL.
+const ai = new OpenAI({
+  apiKey: process.env.AI_API_KEY || process.env.OPENAI_API_KEY || "missing",
+  baseURL: process.env.AI_BASE_URL || undefined, // undefined = OpenAI
+  maxRetries: 1,
+});
+const AI_MODEL = process.env.AI_MODEL || "gemini-3.5-flash";
+// Backup models tried in order when the main one is overloaded or rate-limited.
+const AI_FALLBACK_MODELS = (process.env.AI_FALLBACK_MODELS || "")
+  .split(",").map((m) => m.trim()).filter((m) => m && m !== AI_MODEL);
 
-    const response = await fetch("https://api.openai.com/v1/chat/completions", {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "Authorization": `Bearer ${process.env.OPENAI_API_KEY}`, // ✅ from .env
-      },
-      body: JSON.stringify({
-        model: "gpt-4o-mini", // or whichever model you use
+const isCapacityError = (e) =>
+  e instanceof OpenAI.InternalServerError || e instanceof OpenAI.RateLimitError ||
+  e instanceof OpenAI.APIConnectionTimeoutError;
+
+// Endpoint to call the AI
+app.post("/api/generate-schedule", async (req, res) => {
+  const { prompt } = req.body;
+  if (!process.env.AI_API_KEY && !process.env.OPENAI_API_KEY) {
+    return res.status(500).json({ error: { message: "No AI API key configured. Set AI_API_KEY in .env and restart the server." } });
+  }
+
+  let lastError;
+  for (const model of [AI_MODEL, ...AI_FALLBACK_MODELS]) {
+    try {
+      const completion = await ai.chat.completions.create({
+        model,
         messages: [
           { role: "system", content: "You are a helpful scheduling assistant." },
-          { role: "user", content: prompt }
+          { role: "user", content: prompt },
         ],
-      }),
-    });
-
-    const data = await response.json();
-    res.json(data);
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: "Something went wrong" });
+      });
+      if (model !== AI_MODEL) console.warn(`[ai] answered by fallback model ${model}`);
+      return res.json(completion);
+    } catch (err) {
+      lastError = err;
+      if (isCapacityError(err)) {
+        console.warn(`[ai] ${model} unavailable (${err.message.slice(0, 120)}); trying the next model`);
+        continue;
+      }
+      break;
+    }
   }
+
+  console.error("AI error:", lastError);
+  res.status(lastError?.status || 500).json({ error: { message: lastError?.message || "Something went wrong" } });
 });
 
 app.listen(PORT, () => {
