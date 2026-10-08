@@ -1,33 +1,14 @@
-const TIME_ZONES = typeof Intl.supportedValuesOf === 'function' ? Intl.supportedValuesOf('timeZone') : []
-
-// "Wed, Oct 8 · 7:00 PM – 8:30 PM"
-function formatRange(start, end) {
-  if (!start || !end) return 'Set a start and end time'
-  const s = new Date(start)
-  const e = new Date(end)
-  if (isNaN(s) || isNaN(e)) return 'Invalid date'
-  const day = s.toLocaleDateString(undefined, { weekday: 'short', month: 'short', day: 'numeric' })
-  const time = (d) => d.toLocaleTimeString(undefined, { hour: 'numeric', minute: '2-digit' })
-  return `${day} · ${time(s)} – ${time(e)}`
-}
-
-export function validateEvent(event) {
-  if (!event.summary.trim()) return 'Title is required.'
-  if (!event.start || !event.end) return 'Start and end are required.'
-  if (event.end <= event.start) return 'End must be after start.'
-  if (!event.timeZone) return 'Time zone is required.'
-  return null
-}
+import { KNOWN_TIME_ZONES, TIME_ZONE_GROUPS, formatRange } from '../dates.js'
+import { validateEvent } from '../eventUtils.js'
 
 const STATUS_LABELS = {
   importing: 'Importing…',
-  imported: '✓ Added to calendar',
   error: 'Failed',
 }
 
-export default function EventCard({ event, index, onChange, onRemove, disabled }) {
+export default function EventCard({ event, index, edited, onChange, onRemove, disabled }) {
   const problem = validateEvent(event)
-  const locked = disabled || event.status === 'imported' || event.status === 'importing'
+  const locked = disabled || event.status === 'importing'
   const update = (field) => (e) => onChange({ ...event, [field]: e.target.value })
 
   return (
@@ -35,6 +16,7 @@ export default function EventCard({ event, index, onChange, onRemove, disabled }
       <div className="event-card-top">
         <span className="event-index">{index + 1}</span>
         <span className="event-when">{formatRange(event.start, event.end)}</span>
+        {edited && <span className="status edited">Edited</span>}
         {STATUS_LABELS[event.status] && (
           <span className={`status ${event.status}`}>{STATUS_LABELS[event.status]}</span>
         )}
@@ -66,13 +48,20 @@ export default function EventCard({ event, index, onChange, onRemove, disabled }
         </label>
         <label className="field">
           <span>Time zone</span>
-          <input
-            type="text"
-            list="time-zones"
-            value={event.timeZone}
-            onChange={update('timeZone')}
-            disabled={locked}
-          />
+          <select value={event.timeZone} onChange={update('timeZone')} disabled={locked}>
+            {!KNOWN_TIME_ZONES.has(event.timeZone) && (
+              <option value={event.timeZone}>{event.timeZone || 'Choose a time zone'}</option>
+            )}
+            {TIME_ZONE_GROUPS.map((group) => (
+              <optgroup key={group.area} label={group.area}>
+                {group.zones.map((zone) => (
+                  <option key={zone.value} value={zone.value}>
+                    {zone.label}
+                  </option>
+                ))}
+              </optgroup>
+            ))}
+          </select>
         </label>
       </div>
 
@@ -81,18 +70,8 @@ export default function EventCard({ event, index, onChange, onRemove, disabled }
         <textarea rows={3} value={event.description} onChange={update('description')} disabled={locked} />
       </label>
 
-      {problem && event.status !== 'imported' && <p className="field-error">{problem}</p>}
+      {problem && <p className="field-error">{problem}</p>}
       {event.error && <p className="field-error">{event.error}</p>}
     </article>
-  )
-}
-
-export function TimeZoneOptions() {
-  return (
-    <datalist id="time-zones">
-      {TIME_ZONES.map((tz) => (
-        <option key={tz} value={tz} />
-      ))}
-    </datalist>
   )
 }

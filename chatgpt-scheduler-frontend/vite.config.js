@@ -13,6 +13,7 @@ export default defineConfig({
       '/api': BACKEND_URL,
       '/auth/status': BACKEND_URL,
       '/add-event': BACKEND_URL,
+      '/import-events': BACKEND_URL,
       '/create-calendar': BACKEND_URL,
     },
   },

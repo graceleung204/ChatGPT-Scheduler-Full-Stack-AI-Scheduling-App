@@ -2,9 +2,21 @@
 require("dotenv").config();
 
 const express = require("express");
-const { google } = require("googleapis");
 const cookieSession = require("cookie-session");
-const OpenAI = require("openai");
+const {
+  CALENDAR_NAME,
+  AuthRequiredError,
+  createOAuthClient,
+  calendarForSession,
+  rethrowIfAuthError,
+  verifyConnection,
+  listAllCalendars,
+  ensureScheduleCalendar,
+  insertEvent,
+  isValidClientId,
+} = require("./lib/googleCalendar");
+const { validateImportEvent } = require("./lib/dates");
+const { generatePlan, hasApiKey } = require("./lib/planner");
 
 const app = express();
 app.use(express.json());
@@ -16,13 +28,22 @@ app.use(
   })
 );
 
-const oauth2Client = new google.auth.OAuth2(
-  process.env.GOOGLE_CLIENT_ID,
-  process.env.GOOGLE_CLIENT_SECRET,
-  process.env.GOOGLE_REDIRECT_URI
-);
-
 const PORT = 3000;
+
+// Runs a Google route: 401 when credentials are missing/expired/revoked, 500 otherwise.
+const googleRoute = (label, handler) => async (req, res) => {
+  try {
+    await handler(req, res);
+  } catch (err) {
+    try {
+      rethrowIfAuthError(req, err);
+    } catch (authErr) {
+      return res.status(401).json({ code: "GOOGLE_AUTH_REQUIRED", message: authErr.message });
+    }
+    console.error(`Error in ${label}:`, err);
+    res.status(500).json({ message: `❌ Failed to ${label}.` });
+  }
+};
 
 app.get("/", (req, res) => {
   res.send("Server is running 🚀");
@@ -30,7 +51,7 @@ app.get("/", (req, res) => {
 
 app.get("/auth", (req, res) => {
     const scopes = ["https://www.googleapis.com/auth/calendar"];
-    const url = oauth2Client.generateAuthUrl({
+    const url = createOAuthClient().generateAuthUrl({
       access_type: "offline", // so you get a refresh token
       scope: scopes,
       prompt: "consent", // force asking for consent to get refresh token
@@ -38,196 +59,148 @@ app.get("/auth", (req, res) => {
     res.redirect(url);
 });
 
-// Lets the frontend know whether this session has signed in to Google.
-app.get("/auth/status", (req, res) => {
-    res.json({ connected: Boolean(req.session.tokens) });
+// Asks Google whether the stored credentials still work (not only whether they exist).
+app.get("/auth/status", async (req, res) => {
+    try {
+      res.json({ connected: await verifyConnection(req) });
+    } catch (err) {
+      console.error("Error checking Google connection:", err);
+      res.status(502).json({ message: "Couldn't reach Google to check the connection." });
+    }
 });
+
+// Page shown in the sign-in popup: reports the result to the app window, then always closes.
+function authResultPage(ok, message) {
+  const payload = JSON.stringify({ source: "chatgpt-scheduler-auth", ok, message }).replace(/</g, "\\u003c");
+  return `<!doctype html><meta charset="utf-8"><title>Google Calendar</title>
+<body style="font-family: system-ui, sans-serif; padding: 2rem;">
+<p>${ok ? "✅" : "❌"} ${message}</p><p>This window closes automatically.</p>
+<script>
+  try { if (window.opener) window.opener.postMessage(${payload}, "*"); } catch (e) {}
+  setTimeout(function () { window.close(); }, ${ok ? 300 : 1500});
+</script></body>`;
+}
 
 app.get("/oauth2callback", async (req, res) => {
+    // The user pressed Cancel / denied access on Google's consent screen.
+    if (req.query.error) {
+      const message = req.query.error === "access_denied"
+        ? "Google sign-in was cancelled."
+        : "Google sign-in failed. Please try again.";
+      return res.send(authResultPage(false, message));
+    }
+
     const code = req.query.code;
-    if (!code) return res.send("No code provided ❌");
-  
+    if (!code) return res.send(authResultPage(false, "No code provided by Google. Please try again."));
+
     try {
       // Exchange code for tokens
-      const { tokens } = await oauth2Client.getToken(code);
-      oauth2Client.setCredentials(tokens);
-  
-      // Store tokens in session (so we can use later)
+      const { tokens } = await createOAuthClient().getToken(code);
+
+      // Store tokens in session (so we can use later); a new sign-in may be a different account.
       req.session.tokens = tokens;
-  
-      // Closes itself when opened as a popup by the frontend; the frontend then re-checks /auth/status.
-      res.send(`<p>✅ Google Calendar connected! You can close this window and return to the app.</p>
-        <script>if (window.opener) setTimeout(() => window.close(), 1000);</script>`);
+      req.session.googleAccount = null;
+      req.session.calendarId = null;
+
+      res.send(authResultPage(true, "Google Calendar connected!"));
     } catch (err) {
       console.error("Error retrieving tokens:", err);
-      res.send("❌ Error retrieving access token.");
+      res.send(authResultPage(false, "Error retrieving access token. Please try again."));
     }
 });
 
-app.get("/list-calendars", async (req, res) => {
-    if (!req.session.tokens) return res.send("Not logged in ❌");
-  
-    oauth2Client.setCredentials(req.session.tokens);
-    const calendar = google.calendar({ version: "v3", auth: oauth2Client });
-  
-    try {
-      const response = await calendar.calendarList.list();
-      res.json(response.data.items);
-    } catch (err) {
-      console.error("Calendar API error:", err);
-      res.send("❌ Failed to fetch calendars.");
-    }
-});
+app.get("/list-calendars", googleRoute("fetch calendars", async (req, res) => {
+    const calendar = calendarForSession(req);
+    res.json(await listAllCalendars(calendar));
+}));
 
-app.get("/create-calendar", async (req, res) => {
-    if (!req.session.tokens) return res.send("Not logged in ❌");
-  
-    oauth2Client.setCredentials(req.session.tokens);
-    const calendar = google.calendar({ version: "v3", auth: oauth2Client });
-  
-    try {
-      // 1️⃣ Get existing calendars
-      const listResponse = await calendar.calendarList.list();
-      const calendars = listResponse.data.items;
-  
-      // 2️⃣ Check if "ChatGPT Schedule" already exists
-      const existing = calendars.find(cal => cal.summary === "ChatGPT Schedule");
-  
-      if (existing) {
-        return res.json({
-          message: "✅ Calendar already exists",
-          calendar: existing
-        });
-      }
-  
-      // 3️⃣ Create new calendar if not found
-      const newCalendar = await calendar.calendars.insert({
-        requestBody: {
-          summary: "ChatGPT Schedule",
-          timeZone: "America/Los_Angeles", // You can change this to your timezone
-        },
-      });
-  
-      // 4️⃣ Return new calendar
-      res.json({
-        message: "🆕 New calendar created",
-        calendar: newCalendar.data
-      });
-  
-    } catch (err) {
-      console.error("Error creating calendar:", err);
-      res.status(500).send("❌ Failed to create calendar.");
-    }
-});
-
-app.use(express.json()); // make sure you can parse JSON body
-
-app.post("/add-event", async (req, res) => {
-  if (!req.session.tokens) return res.send("Not logged in ❌");
-
-  oauth2Client.setCredentials(req.session.tokens);
-  const calendar = google.calendar({ version: "v3", auth: oauth2Client });
-
-  try {
-    // 1️⃣ Get calendar list
-    const listResponse = await calendar.calendarList.list();
-    const calendars = listResponse.data.items;
-
-    // 2️⃣ Find "ChatGPT Schedule" calendar
-    const targetCalendar = calendars.find(cal => cal.summary === "ChatGPT Schedule");
-    if (!targetCalendar) {
-      return res.status(404).send("❌ ChatGPT Schedule calendar not found. Run /create-calendar first.");
-    }
-
-    // 3️⃣ Read event details from request body
-    const { summary, description, start, end, timeZone } = req.body;
-
-    if (!summary || !start || !end) {
-      return res.status(400).send("❌ Missing required fields: summary, start, end");
-    }
-
-    // 4️⃣ Build event
-    const event = {
-      summary,
-      description: description || "",
-      start: {
-        dateTime: start,
-        timeZone: timeZone || "America/Los_Angeles",
-      },
-      end: {
-        dateTime: end,
-        timeZone: timeZone || "America/Los_Angeles",
-      },
-    };
-
-    // 5️⃣ Insert event
-    const response = await calendar.events.insert({
-      calendarId: targetCalendar.id,
-      requestBody: event,
-    });
-
+// Finds or creates the "ChatGPT Schedule" calendar (idempotent).
+// Optional ?timeZone=Area/City sets the time zone of a newly created calendar.
+app.get("/create-calendar", googleRoute("create calendar", async (req, res) => {
+    const calendar = calendarForSession(req);
+    const result = await ensureScheduleCalendar(req, calendar, req.query.timeZone);
     res.json({
-      message: "✅ Event created",
-      event: response.data,
+      message: result.created ? "🆕 New calendar created" : "✅ Calendar already exists",
+      calendar: result.calendar,
     });
+}));
 
-  } catch (err) {
-    console.error("Error adding event:", err);
-    res.status(500).send("❌ Failed to add event.");
+// Adds one event. Body: { summary, description, start, end, timeZone, clientId? }
+app.post("/add-event", googleRoute("add event", async (req, res) => {
+  const { event, error } = validateImportEvent(req.body);
+  if (error) return res.status(400).json({ message: `❌ ${error}` });
+  if (req.body.clientId && !isValidClientId(req.body.clientId)) {
+    return res.status(400).json({ message: "❌ clientId must be 5+ characters of 0-9 and a-v." });
   }
-});
 
-// AI client: the OpenAI SDK works with any OpenAI-compatible API (Google Gemini, OpenAI, Groq…).
-// Configured in .env with AI_BASE_URL, AI_API_KEY and AI_MODEL.
-const ai = new OpenAI({
-  apiKey: process.env.AI_API_KEY || process.env.OPENAI_API_KEY || "missing",
-  baseURL: process.env.AI_BASE_URL || undefined, // undefined = OpenAI
-  maxRetries: 1,
-});
-const AI_MODEL = process.env.AI_MODEL || "gemini-3.5-flash";
-// Backup models tried in order when the main one is overloaded or rate-limited.
-const AI_FALLBACK_MODELS = (process.env.AI_FALLBACK_MODELS || "")
-  .split(",").map((m) => m.trim()).filter((m) => m && m !== AI_MODEL);
+  const calendar = calendarForSession(req);
+  const { calendar: target } = await ensureScheduleCalendar(req, calendar, event.timeZone);
+  const result = await insertEvent(calendar, target.id, event, req.body.clientId);
+  res.json({ message: "✅ Event created", event: result });
+}));
 
-const isCapacityError = (e) =>
-  e instanceof OpenAI.InternalServerError || e instanceof OpenAI.RateLimitError ||
-  e instanceof OpenAI.APIConnectionTimeoutError;
+// Imports a whole plan. Body: { events: [{ clientId, summary, description, start, end, timeZone }], timeZone }
+// All events are validated first (nothing is written if any is invalid), the calendar is
+// found or created once, then each event is inserted. clientId makes retries duplicate-free.
+app.post("/import-events", googleRoute("import events", async (req, res) => {
+  const input = Array.isArray(req.body.events) ? req.body.events : [];
+  if (input.length === 0) return res.status(400).json({ message: "❌ No events to import." });
 
-// Endpoint to call the AI
+  const validated = input.map((raw) => {
+    if (!isValidClientId(raw?.clientId)) return { clientId: raw?.clientId, error: "Missing or invalid clientId." };
+    const { event, error } = validateImportEvent(raw);
+    return { clientId: raw.clientId, event, error };
+  });
+  const invalid = validated.filter((v) => v.error);
+  if (invalid.length > 0) {
+    return res.status(400).json({
+      message: `❌ ${invalid.length} event${invalid.length === 1 ? " is" : "s are"} invalid. Nothing was imported.`,
+      results: invalid.map(({ clientId, error }) => ({ clientId, ok: false, error })),
+    });
+  }
+
+  const calendar = calendarForSession(req);
+  const { calendar: target } = await ensureScheduleCalendar(req, calendar, req.body.timeZone);
+
+  const results = [];
+  for (const { clientId, event } of validated) {
+    try {
+      results.push({ clientId, ...(await insertEvent(calendar, target.id, event, clientId)) });
+    } catch (err) {
+      // Lost access mid-import: report what was already added so the client can resume.
+      try {
+        rethrowIfAuthError(req, err);
+      } catch (authErr) {
+        if (authErr instanceof AuthRequiredError) {
+          return res.status(401).json({ code: "GOOGLE_AUTH_REQUIRED", message: authErr.message, results });
+        }
+      }
+      console.error("Error adding event:", err);
+      results.push({ clientId, ok: false, error: err.response?.data?.error?.message || "Google rejected this event." });
+    }
+  }
+
+  res.json({ calendar: { id: target.id, name: CALENDAR_NAME }, results });
+}));
+
+// Chat with the AI. Body: { messages, currentPlan, edits, client: { now, timeZone } }
+// Returns { reply, events | null, warnings }.
 app.post("/api/generate-schedule", async (req, res) => {
-  const { prompt } = req.body;
-  if (!process.env.AI_API_KEY && !process.env.OPENAI_API_KEY) {
+  if (!hasApiKey()) {
     return res.status(500).json({ error: { message: "No AI API key configured. Set AI_API_KEY in .env and restart the server." } });
   }
-
-  let lastError;
-  for (const model of [AI_MODEL, ...AI_FALLBACK_MODELS]) {
-    try {
-      const completion = await ai.chat.completions.create({
-        model,
-        messages: [
-          { role: "system", content: "You are a helpful scheduling assistant." },
-          { role: "user", content: prompt },
-        ],
-      });
-      if (model !== AI_MODEL) console.warn(`[ai] answered by fallback model ${model}`);
-      return res.json(completion);
-    } catch (err) {
-      lastError = err;
-      if (isCapacityError(err)) {
-        console.warn(`[ai] ${model} unavailable (${err.message.slice(0, 120)}); trying the next model`);
-        continue;
-      }
-      break;
-    }
+  if (!Array.isArray(req.body.messages) || req.body.messages.length === 0) {
+    return res.status(400).json({ error: { message: "messages must be a non-empty array." } });
   }
 
-  console.error("AI error:", lastError);
-  res.status(lastError?.status || 500).json({ error: { message: lastError?.message || "Something went wrong" } });
+  try {
+    res.json(await generatePlan(req.body));
+  } catch (err) {
+    console.error("AI error:", err);
+    res.status(err?.status || 500).json({ error: { message: err?.message || "Something went wrong" } });
+  }
 });
 
 app.listen(PORT, () => {
   console.log(`Server running on http://localhost:${PORT}`);
 });
-
-
