@@ -66,7 +66,10 @@ export async function fetchAuthStatus() {
  * Falls back to a new tab if popups are blocked (the app re-checks when the tab regains focus).
  */
 export function openGoogleSignIn() {
-  const url = '/auth'
+  // In production, tell the backend our origin so Google redirects back to this domain
+  // (register https://<this-domain>/oauth2callback on the Google OAuth client).
+  // Locally, the backend's GOOGLE_REDIRECT_URI (http://localhost:3000/oauth2callback) is used.
+  const url = import.meta.env.PROD ? `/auth?origin=${encodeURIComponent(window.location.origin)}` : '/auth'
   const popup = window.open(url, 'google-auth', 'width=520,height=680')
   if (!popup) {
     window.open(url, '_blank')

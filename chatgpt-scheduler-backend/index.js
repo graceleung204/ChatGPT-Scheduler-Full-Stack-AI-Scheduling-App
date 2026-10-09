@@ -62,9 +62,26 @@ app.get("/", (req, res) => {
   res.send("Server is running 🚀");
 });
 
+// Where Google sends the user back after sign-in. The deployed frontend passes its own origin
+// (?origin=https://app.example.com) because it proxies this API, so the callback and the session
+// cookie stay on its domain. Google itself only accepts redirect URIs registered on the OAuth
+// client; ALLOWED_ORIGINS (comma-separated) can restrict it further. Otherwise GOOGLE_REDIRECT_URI.
+const ORIGIN_RE = /^https?:\/\/[a-z0-9.-]+(?::\d{1,5})?$/i;
+const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS || "")
+  .split(",").map((o) => o.trim().replace(/\/$/, "")).filter(Boolean);
+
+function redirectUriFor(origin) {
+  if (typeof origin !== "string" || !ORIGIN_RE.test(origin)) return process.env.GOOGLE_REDIRECT_URI;
+  if (ALLOWED_ORIGINS.length > 0 && !ALLOWED_ORIGINS.includes(origin)) return process.env.GOOGLE_REDIRECT_URI;
+  return `${origin}/oauth2callback`;
+}
+
 app.get("/auth", (req, res) => {
     const scopes = ["https://www.googleapis.com/auth/calendar"];
-    const url = createOAuthClient().generateAuthUrl({
+    // Remembered so the callback exchanges the code with the same redirect URI.
+    const redirectUri = redirectUriFor(req.query.origin);
+    req.session.oauthRedirectUri = redirectUri;
+    const url = createOAuthClient(redirectUri).generateAuthUrl({
       access_type: "offline", // so you get a refresh token
       scope: scopes,
       prompt: "consent", // force asking for consent to get refresh token
@@ -108,7 +125,9 @@ app.get("/oauth2callback", async (req, res) => {
 
     try {
       // Exchange code for tokens
-      const { tokens } = await createOAuthClient().getToken(code);
+      const redirectUri = req.session.oauthRedirectUri || process.env.GOOGLE_REDIRECT_URI;
+      const { tokens } = await createOAuthClient(redirectUri).getToken({ code, redirect_uri: redirectUri });
+      req.session.oauthRedirectUri = null;
 
       // Store tokens in session (so we can use later); a new sign-in may be a different account.
       req.session.tokens = tokens;

@@ -4,11 +4,12 @@ const { DEFAULT_TIME_ZONE, canonicalTimeZone } = require("./dates");
 
 const CALENDAR_NAME = "ChatGPT Schedule";
 
-function createOAuthClient() {
+// `redirectUri` defaults to GOOGLE_REDIRECT_URI; the sign-in routes pass the frontend's own one.
+function createOAuthClient(redirectUri = process.env.GOOGLE_REDIRECT_URI) {
   return new google.auth.OAuth2(
     process.env.GOOGLE_CLIENT_ID,
     process.env.GOOGLE_CLIENT_SECRET,
-    process.env.GOOGLE_REDIRECT_URI
+    redirectUri
   );
 }
 
