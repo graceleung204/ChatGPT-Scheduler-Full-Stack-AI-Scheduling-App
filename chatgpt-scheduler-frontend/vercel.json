@@ -1,0 +1,13 @@
+{
+  "$schema": "https://openapi.vercel.sh/vercel.json",
+  "rewrites": [
+    { "source": "/api/:path*", "destination": "https://chat-gpt-scheduler-full-stack-ai-sc.vercel.app/api/:path*" },
+    { "source": "/auth", "destination": "https://chat-gpt-scheduler-full-stack-ai-sc.vercel.app/auth" },
+    { "source": "/auth/:path*", "destination": "https://chat-gpt-scheduler-full-stack-ai-sc.vercel.app/auth/:path*" },
+    { "source": "/oauth2callback", "destination": "https://chat-gpt-scheduler-full-stack-ai-sc.vercel.app/oauth2callback" },
+    { "source": "/import-events", "destination": "https://chat-gpt-scheduler-full-stack-ai-sc.vercel.app/import-events" },
+    { "source": "/create-calendar", "destination": "https://chat-gpt-scheduler-full-stack-ai-sc.vercel.app/create-calendar" },
+    { "source": "/add-event", "destination": "https://chat-gpt-scheduler-full-stack-ai-sc.vercel.app/add-event" },
+    { "source": "/list-calendars", "destination": "https://chat-gpt-scheduler-full-stack-ai-sc.vercel.app/list-calendars" }
+  ]
+}

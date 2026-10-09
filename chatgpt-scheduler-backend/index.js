@@ -18,17 +18,30 @@ const {
 const { validateImportEvent } = require("./lib/dates");
 const { generatePlan, hasApiKey } = require("./lib/planner");
 
+const isProduction = process.env.NODE_ENV === "production" || Boolean(process.env.VERCEL);
+
+// Signs the session cookie. Set SESSION_SECRET in production (e.g. a long random string).
+const SESSION_SECRET = process.env.SESSION_SECRET || "secretkey123";
+if (isProduction && !process.env.SESSION_SECRET) {
+  console.warn("[config] SESSION_SECRET is not set; using an insecure default.");
+}
+
 const app = express();
+// Behind Vercel's proxy: trust X-Forwarded-Proto so secure cookies can be set over HTTPS.
+app.set("trust proxy", 1);
 app.use(express.json());
 app.use(
   cookieSession({
     name: "session",
-    keys: ["secretkey123"], // replace with something secure
+    keys: [SESSION_SECRET],
     maxAge: 24 * 60 * 60 * 1000, // 24 hours
+    httpOnly: true,
+    sameSite: "lax", // the frontend proxies to this API, so the cookie is first-party
+    secure: isProduction, // HTTPS only in production; plain http://localhost in development
   })
 );
 
-const PORT = 3000;
+const PORT = process.env.PORT || 3000;
 
 // Runs a Google route: 401 when credentials are missing/expired/revoked, 500 otherwise.
 const googleRoute = (label, handler) => async (req, res) => {
@@ -204,3 +217,6 @@ app.post("/api/generate-schedule", async (req, res) => {
 app.listen(PORT, () => {
   console.log(`Server running on http://localhost:${PORT}`);
 });
+
+// Vercel runs the exported Express app as a serverless function.
+module.exports = app;

@@ -1,8 +1,15 @@
-// Calls to the Express backend. In development Vite proxies these paths to it (see vite.config.js).
+// Calls to the Express backend. All paths are same-origin: Vite proxies them in development
+// (vite.config.js) and Vercel rewrites them in production (vercel.json), so the session
+// cookie is always a first-party cookie on the app's own domain.
 import { USER_TIME_ZONE } from './dates.js'
 import { toApiEvent } from './eventUtils.js'
 
-export const BACKEND_URL = import.meta.env.VITE_BACKEND_URL || 'http://localhost:3000'
+// Origins allowed to report the Google sign-in result. Locally, Google redirects straight to
+// the backend (GOOGLE_REDIRECT_URI=http://localhost:3000/oauth2callback), so allow that too.
+const AUTH_MESSAGE_ORIGINS = new Set([
+  window.location.origin,
+  ...(import.meta.env.DEV ? [import.meta.env.VITE_DEV_BACKEND_URL || 'http://localhost:3000'] : []),
+])
 
 /** Google credentials are missing, expired or revoked: the user has to connect again. */
 export class AuthRequiredError extends Error {
@@ -59,7 +66,7 @@ export async function fetchAuthStatus() {
  * Falls back to a new tab if popups are blocked (the app re-checks when the tab regains focus).
  */
 export function openGoogleSignIn() {
-  const url = `${BACKEND_URL}/auth`
+  const url = '/auth'
   const popup = window.open(url, 'google-auth', 'width=520,height=680')
   if (!popup) {
     window.open(url, '_blank')
@@ -68,14 +75,13 @@ export function openGoogleSignIn() {
   popup.focus()
 
   return new Promise((resolve) => {
-    const backendOrigin = new URL(BACKEND_URL).origin
     const finish = (result) => {
       clearInterval(timer)
       window.removeEventListener('message', onMessage)
       resolve(result)
     }
     const onMessage = (event) => {
-      if (event.origin !== backendOrigin || event.data?.source !== 'chatgpt-scheduler-auth') return
+      if (!AUTH_MESSAGE_ORIGINS.has(event.origin) || event.data?.source !== 'chatgpt-scheduler-auth') return
       try {
         popup.close()
       } catch {
